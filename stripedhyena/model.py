@@ -48,12 +48,12 @@ class AttentionBlock(nn.Module):
             out_proj_bias=config.get("mha_out_proj_bias", True),
             use_flash_attn=self.config.use_flash_attn,
         ).to(dtype=dtype)
-
+        
         # check if using interpolated rotary pos emb from config, and swap the rope emb
         if config.get("use_interpolated_rotary_pos_emb", False):
             swap_mha_rope(
                 mha=self.inner_mha_cls,
-                kwargs_new_rope={"scaling_factor": config.get("rotary_emb_scaling_factor", 1.0)},
+                kwargs_new_rope={'scaling_factor': config.get("rotary_emb_scaling_factor", 1.)},
             )
 
         if self.config.get("smeared_gqa", False):
@@ -61,6 +61,7 @@ class AttentionBlock(nn.Module):
         self.inner_mha_cls.rotary_emb.register_buffer("inv_freq", self.inner_mha_cls.rotary_emb.inv_freq)
 
         self.mlp = ParallelGatedMLP(config).to(dtype=mlp_dtype)
+        self.filter_output = None
 
     def forward(self, u, inference_params=None, padding_mask=None, *args, **kwargs):
         if (
@@ -68,14 +69,12 @@ class AttentionBlock(nn.Module):
         ):  # workaround for masking bug in FA. This works because Wqkv does not have bias
             # and attention scores will be also automatically zeroed.
             u = u * padding_mask[..., None]
-
-        u = (
-            self.inner_mha_cls(
+        w = self.inner_mha_cls(
                 self.pre_norm(u),
                 inference_params=inference_params,
-            )
-            + u
         )
+        self.filter_output = w
+        u = w + u
         if type(padding_mask) == torch.Tensor:  # guard against bias
             u = u * padding_mask[..., None]
         u = self.mlp(self.post_norm(u)) + u
@@ -287,6 +286,7 @@ class ParallelGatedConvBlock(nn.Module):
         self.projections = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.out_filter_dense = nn.Linear(config.hidden_size, config.hidden_size).to(dtype)
         self.mlp = ParallelGatedMLP(config).to(dtype=mlp_dtype)
+        self.filter_output = None
 
         self.proj_norm_fn = self.proj_norm
         self.res_mlp_norm_fn = self.res_mlp_norm
@@ -310,6 +310,8 @@ class ParallelGatedConvBlock(nn.Module):
             z = z * padding_mask[..., None]
 
         z, inference_params = self.filter(z, inference_params=inference_params, padding_mask=padding_mask)
+
+        self.filter_output = z
 
         z_in = self.out_filter_dense(z) + u
 
